@@ -15,12 +15,16 @@ namespace Paymos\Wallet;
  * never logs or echoes a request body.
  *
  * Transport failures are wrapped into a typed error with no status, so a caller on the money
- * path never catches a raw curl error.
+ * path never catches a raw curl error. A body that is not JSON — on any status — is a typed error
+ * too, naming the status and content type; it is never a null handed to the caller.
  */
 final class Http
 {
     /** The sign/aggregate round can trigger a relay that takes a while. */
     private const DEFAULT_TIMEOUT = 60;
+
+    /** How much of an unexpected body a message quotes: enough to recognise a proxy page. */
+    private const SNIPPET_CHARS = 200;
 
     /** @var null|callable(string $method, string $url, array $headers, ?string $body): array{0: int, 1: array, 2: string} */
     private $transport;
@@ -44,8 +48,14 @@ final class Http
 
     public function post(string $path, array $body, array $extraHeaders = []): mixed
     {
+        try {
+            $json = json_encode($body, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            // Invalid UTF-8 in an address, say. Refuse before anything reaches the wire.
+            throw new PaymosError('request body is not encodable as JSON: ' . $e->getMessage());
+        }
         return $this->request('POST', $this->baseUrl . $path,
-            array_merge(['content-type' => 'application/json'], $extraHeaders), json_encode($body));
+            array_merge(['content-type' => 'application/json'], $extraHeaders), $json);
     }
 
     private function request(string $method, string $url, array $headers, ?string $body): mixed
@@ -63,12 +73,40 @@ final class Http
         } catch (\Throwable $e) {
             throw new PaymosError('transport error: ' . $e->getMessage());
         }
+        $status = (int)$status;
+        $text = (string)$text;
+        $respHeaders = array_change_key_case(is_array($respHeaders) ? $respHeaders : [], CASE_LOWER);
+        $contentType = isset($respHeaders['content-type']) ? (string)$respHeaders['content-type'] : null;
 
-        $parsed = $text === '' ? null : json_decode($text, true);
+        // The Vault API answers JSON on every status, errors included. A body that is not JSON is
+        // almost always something standing in front of it — a proxy's HTML 404, a CDN page, the
+        // wrong base URL — and it must surface as a typed error, never as a parse failure or null.
+        $parsed = self::decode($text, $isJson);
         if ($status >= 200 && $status < 300) {
+            if (!$isJson) {
+                throw new PaymosError(self::notJsonMessage($status, $contentType, $text), $status);
+            }
             return $parsed;
         }
-        throw self::raiseFor($status, is_array($parsed) ? $parsed : null, $text, $respHeaders['retry-after'] ?? null);
+        $message = $isJson
+            ? self::messageOf(is_array($parsed) ? $parsed : null, $status, $text)
+            : self::notJsonMessage($status, $contentType, $text);
+        $retryAfter = $respHeaders['retry-after'] ?? null;
+        throw self::raiseFor($status, $message, is_scalar($retryAfter) ? (string)$retryAfter : null);
+    }
+
+    /** JSON-decode without ever throwing; $isJson says whether $text was JSON at all. */
+    private static function decode(string $text, ?bool &$isJson): mixed
+    {
+        try {
+            // Big integers stay strings: a raw amount must never pass through a float.
+            $parsed = json_decode($text, true, 512, JSON_THROW_ON_ERROR | JSON_BIGINT_AS_STRING);
+            $isJson = true;
+            return $parsed;
+        } catch (\JsonException) {
+            $isJson = false;
+            return null;
+        }
     }
 
     /** @return array{0: int, 1: array, 2: string} */
@@ -84,7 +122,11 @@ final class Http
             CURLOPT_CUSTOMREQUEST => $method,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => $this->timeout,
-            CURLOPT_FOLLOWLOCATION => true, // GitHub releases redirect to a CDN
+            CURLOPT_CONNECTTIMEOUT => min(10, $this->timeout),
+            // Never follow a redirect: the API does not issue one, a 3xx here means something in
+            // front of it answered, and following it would replay the bearer token and the POST
+            // body somewhere else. It surfaces as a typed error instead, like the Python SDK.
+            CURLOPT_FOLLOWLOCATION => false,
             CURLOPT_HTTPHEADER => $headerLines,
             CURLOPT_HEADERFUNCTION => function ($ch, $line) use (&$respHeaders) {
                 $parts = explode(':', $line, 2);
@@ -98,13 +140,12 @@ final class Http
             curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
         }
         $text = curl_exec($ch);
+        // No curl_close(): it has done nothing since PHP 8.0 and is deprecated in 8.5, where every
+        // call would print a deprecation notice into the caller's output. The handle frees itself.
         if ($text === false) {
-            $err = curl_error($ch);
-            curl_close($ch);
-            throw new PaymosError("transport error: $err");
+            throw new PaymosError('transport error: ' . curl_error($ch));
         }
         $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
-        curl_close($ch);
         return [$status, $respHeaders, (string)$text];
     }
 
@@ -118,8 +159,30 @@ final class Http
                 }
             }
         }
-        $trimmed = trim($text);
-        return $trimmed === '' ? "request failed with status $status" : $trimmed;
+        $snippet = self::snippet($text);
+        return $snippet === '' ? "request failed with status $status" : $snippet;
+    }
+
+    /** Same words as the Python SDK, so a support ticket reads the same whichever SDK sent it. */
+    private static function notJsonMessage(int $status, ?string $contentType, string $text): string
+    {
+        $ctype = trim(explode(';', (string)$contentType)[0]);
+        $msg = "unexpected non-JSON response (HTTP $status, " . ($ctype === '' ? 'no content-type' : $ctype)
+            . ') — check that the base URL (PAYMOS_BASE_URL) points at the Paymos wallet API';
+        $snippet = self::snippet($text);
+        return $snippet === '' ? $msg : "$msg: $snippet";
+    }
+
+    /** The start of a body, whitespace collapsed and cut short — never a whole HTML page. */
+    private static function snippet(string $text): string
+    {
+        $flat = trim((string)preg_replace('/\s+/', ' ', $text));
+        if (strlen($flat) <= self::SNIPPET_CHARS) {
+            return $flat;
+        }
+        // Cut on bytes, then drop a trailing multi-byte sequence the cut may have split.
+        $cut = (string)preg_replace('/[\x80-\xBF]*[\xC0-\xFF]?$/', '', substr($flat, 0, self::SNIPPET_CHARS));
+        return $cut . '…';
     }
 
     /** Map a 400's message to a type. First match wins, in this exact order. */
@@ -150,9 +213,8 @@ final class Http
         return new PaymosError($message, $status);
     }
 
-    private static function raiseFor(int $status, ?array $body, string $text, ?string $retryAfterHeader): PaymosError
+    private static function raiseFor(int $status, string $message, ?string $retryAfterHeader): PaymosError
     {
-        $message = self::messageOf($body, $status, $text);
         return match ($status) {
             401 => new AuthError($message, $status),
             403 => new Forbidden($message, $status),

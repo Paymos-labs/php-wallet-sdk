@@ -91,8 +91,9 @@ amounts as digit strings. `Amounts::parseUnits` / `Amounts::formatUnits` convert
 
 **Moving money.** `swap` and `withdraw` (full key only) create a real movement and drive the
 2-of-2 co-sign. Before any signature the SDK re-checks that the server's quote echoes exactly
-the assets and amount you approved — a decimals bug, contract drift, or a lying server throws
-and **signs nothing**.
+the assets and amount you approved — a decimals bug, contract drift, or a quote for something
+else throws and **signs nothing**. For an `exact_out` withdraw the debit is computed by the server,
+so pass `maxDebit` to bound it.
 
 ```php
 $mv = $w->swap('USDC@base', 'ETH@arb', '100', minReceive: '0.03');
@@ -153,9 +154,26 @@ a read key can never sign.
 - A leaked **API key alone cannot move funds** — no share, no signature (and the key can be
   revoked).
 - A leaked **share alone cannot move funds** — no server co-sign.
-- Both are required, on purpose. The SDK additionally verifies every message it co-signs, and
-  that the server's quote matches exactly what you approved — so a compromised server can't
-  redirect funds or inflate an amount past your caps.
+- Both are required, on purpose. The SDK additionally checks every message it co-signs before
+  producing a share: the message it signs is the one the server disclosed, it is a single transfer
+  from your vault, it moves the token of the asset you are spending, and all sources together move
+  no more than the quote's debit. It also checks that the quote echoes the assets and amount you
+  asked for.
+- What it does **not** check: the transfer's recipient. The route's deposit address is chosen by
+  the server and is not verified by the SDK. And for an `exact_out` withdraw the debit is itself
+  computed by the server — "no more than the debit" bounds it only as far as you bound the debit,
+  so pass `maxDebit` for unattended payouts.
+- The token check compares against the asset **fingerprint** the server publishes in `assets()` —
+  the same server that builds the messages. On its own it catches a server bug or a compromised
+  signing path, not a server that also lies about the fingerprint. For a trust anchor that does
+  not depend on the server, pin the fingerprints you have verified out of band; a pinned label
+  ignores what the server publishes:
+
+  ```php
+  $w = Wallet::fromEnv(pinnedFingerprints: [
+      'USDC@base' => 'a42c7e46411394e7c7719eef5be19239b2716b91d3a4a843fd3d2c0b6ca16b7c',
+  ]);
+  ```
 
 Treat a full `vs_live_…` secret like a private key, and back up the share — losing it means
 losing your ability to co-sign.
@@ -194,9 +212,12 @@ your half of the signature exists.
 ### Does it blind-sign whatever the server asks for?
 
 No, and this is the part worth reading twice. The server discloses the exact message it wants
-signed; the SDK recomputes the digest itself and refuses unless that message belongs to your vault,
-moves no more than the debit you approved, and matches the request you made. A server asking for
-anything else gets a refusal, not a signature.
+signed; the SDK recomputes the digest itself and refuses unless that message is a single transfer
+from your vault, of the token whose fingerprint the asset carries, moving no more than the quote's
+debit. Anything else gets a refusal, not a signature. Two limits: the recipient of the transfer is
+chosen by the server and not checked, and an `exact_out` debit is server-computed unless you cap it
+with `maxDebit`. The fingerprint comes from the server unless you pin it (`pinnedFingerprints`,
+see Security).
 
 ### Which networks and assets are supported?
 
@@ -215,13 +236,16 @@ it. You pass human amounts in (`"100"`, `"0.5"`) and read exact integers back.
 ### Can I use it for automated payouts?
 
 That is what it is for: headless, no browser, no wallet extension, no seed phrase in the environment.
-A worker holding one share can pay out continuously, and losing that machine costs the ability to
-sign — not the funds.
+A worker holding one share can pay out continuously; set `maxDebit` on every payout, since an
+`exact_out` debit is otherwise computed by the server. A machine that dies costs the ability to sign
+until the share is restored from backup — but a machine that is stolen carries the full secret, API
+key and share together, so revoke the key at once.
 
 ### What happens if a transfer is interrupted?
 
 Every money-moving call takes an idempotency key. Repeating a call with the same key returns the
-original operation instead of starting a second one, so a retry after a timeout cannot pay twice.
+original operation instead of starting a second one. Pass your own (`idempotencyKey:`, e.g. your
+payout id): if you omit it, each call generates a fresh one, and a retry is then a second payment.
 
 ## The same wallet, in eight languages
 

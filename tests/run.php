@@ -16,11 +16,22 @@ if (!getenv('PAYMOS_NATIVE_LIB')) {
     $root = dirname(__DIR__, 3);
     $lib = $root . DIRECTORY_SEPARATOR . 'mpc' . DIRECTORY_SEPARATOR . 'wallet-mpc'
         . DIRECTORY_SEPARATOR . 'target' . DIRECTORY_SEPARATOR . 'release' . DIRECTORY_SEPARATOR
-        . (PHP_OS_FAMILY === 'Windows' ? 'wallet_mpc.dll' : 'libwallet_mpc.so');
+        . match (PHP_OS_FAMILY) {
+            'Windows' => 'wallet_mpc.dll',
+            'Darwin' => 'libwallet_mpc.dylib',
+            default => 'libwallet_mpc.so',
+        };
     if (is_file($lib)) {
         putenv("PAYMOS_NATIVE_LIB=$lib");
     }
 }
+
+// A notice or deprecation is a failure here: "undefined array key" is how a wrong wire shape
+// hides, and a deprecation printed on every call ends up in a merchant's response body.
+error_reporting(E_ALL);
+set_error_handler(function (int $no, string $msg, string $file, int $line): bool {
+    throw new \ErrorException($msg, 0, $no, $file, $line);
+});
 
 $GLOBALS['tests'] = 0;
 $GLOBALS['failures'] = 0;

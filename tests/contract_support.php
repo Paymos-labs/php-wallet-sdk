@@ -1,0 +1,159 @@
+<?php
+
+// Shared by contract_test.php and cosign_test.php: the recorded wire contract, served through the
+// SDK's transport seam. Nothing here reaches the network.
+
+declare(strict_types=1);
+
+use Paymos\Wallet\Native\Core;
+use Paymos\Wallet\VaultSecret;
+use Paymos\Wallet\Wallet;
+
+/**
+ * The fixtures directory: contract/fixtures walking up from this file (how a public mirror vendors
+ * it), then sdk/contract/fixtures (the monorepo). Not finding it is a FAILURE, never a skip — a
+ * suite that quietly stops reading the contract is the exact failure the contract exists to stop.
+ */
+function contractFixturesDir(): string
+{
+    static $found = null;
+    if ($found !== null) {
+        return $found;
+    }
+    foreach (['contract/fixtures', 'sdk/contract/fixtures'] as $rel) {
+        $dir = __DIR__;
+        while (true) {
+            $candidate = $dir . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $rel);
+            if (is_dir($candidate) && is_file($candidate . DIRECTORY_SEPARATOR . 'assets.json')) {
+                return $found = $candidate;
+            }
+            $parent = dirname($dir);
+            if ($parent === $dir) {
+                break;
+            }
+            $dir = $parent;
+        }
+    }
+    throw new \Exception('contract fixtures not found: looked for contract/fixtures, then sdk/contract/fixtures, '
+        . 'walking up from ' . __DIR__);
+}
+
+/** A fixture as associative arrays — what the assertions compare against. */
+function fixture(string $name): array
+{
+    $path = contractFixturesDir() . DIRECTORY_SEPARATOR . $name . '.json';
+    if (!is_file($path)) {
+        throw new \Exception("missing contract fixture $name.json");
+    }
+    return json_decode((string)file_get_contents($path), true, 512, JSON_THROW_ON_ERROR);
+}
+
+/** The fixture's response body re-encoded from objects, so `{}` stays `{}` on the way out. */
+function fixtureBodyText(string $name): string
+{
+    $raw = json_decode((string)file_get_contents(contractFixturesDir() . "/$name.json"), false, 512, JSON_THROW_ON_ERROR);
+    return json_encode($raw->response->body, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+}
+
+/**
+ * A mock vault API. Routes are "METHOD /path?query" → a responder returning [status, headers,
+ * body text] (or a fixture name, served with its recorded status). Every request is recorded with
+ * its decoded JSON body. An unrouted request answers 418 with a JSON error, so it can never pass
+ * for a real answer.
+ */
+final class ContractServer
+{
+    /** @var array<string, string|callable> */
+    public array $routes = [];
+    /** @var list<array{method: string, path: string, headers: array, body: mixed}> */
+    public array $requests = [];
+
+    public function route(string $method, string $path, string|callable $response): self
+    {
+        $this->routes["$method $path"] = $response;
+        return $this;
+    }
+
+    public function transport(): callable
+    {
+        return function (string $method, string $url, array $headers, ?string $body): array {
+            $parts = parse_url($url);
+            $path = ($parts['path'] ?? '') . (isset($parts['query']) ? '?' . $parts['query'] : '');
+            $decoded = $body === null ? null : json_decode($body, true, 512, JSON_THROW_ON_ERROR);
+            $this->requests[] = ['method' => $method, 'path' => $path, 'headers' => $headers, 'body' => $decoded];
+            $r = $this->routes["$method $path"] ?? null;
+            if ($r === null) {
+                return [418, ['content-type' => 'application/json'],
+                    json_encode(['error' => "unrouted request $method $path"])];
+            }
+            if (is_string($r)) {
+                return [fixture($r)['response']['status'], ['content-type' => 'application/json; charset=utf-8'],
+                    fixtureBodyText($r)];
+            }
+            return $r($decoded, $headers);
+        };
+    }
+
+    /** @return list<array{method: string, path: string, headers: array, body: mixed}> */
+    public function requestsTo(string $method, string $pathPrefix): array
+    {
+        return array_values(array_filter($this->requests,
+            fn ($r) => $r['method'] === $method && str_starts_with($r['path'], $pathPrefix)));
+    }
+}
+
+/** A server that already knows the catalog — every amount is validated against it. */
+function contractServer(): ContractServer
+{
+    return (new ContractServer())->route('GET', '/vault/v1/assets', 'assets');
+}
+
+function contractWallet(ContractServer $server, ?string $share = null, ?array $pinnedFingerprints = null): Wallet
+{
+    return new Wallet(VaultSecret::pack('vk_live_contract', 7, $share), 'https://vault.test',
+        transport: $server->transport(), pinnedFingerprints: $pinnedFingerprints);
+}
+
+/** A 200 JSON response. */
+function jsonResponse(mixed $body, int $status = 200): array
+{
+    return [$status, ['content-type' => 'application/json'], json_encode($body, JSON_THROW_ON_ERROR)];
+}
+
+/**
+ * A real 2-of-2 key, generated by the same core the server runs. The client half goes into the
+ * vault secret; the server half stays with the test, which plays the server's side of the co-sign.
+ *
+ * @return array{client: array, server: array, public: array, group: string}
+ */
+function contractDkg(): array
+{
+    static $keys = null;
+    if ($keys !== null) {
+        return $keys;
+    }
+    $pick = function (array $packages, int $id): array {
+        foreach ($packages as [$pid, $pkg]) {
+            if ($pid === $id) {
+                return $pkg;
+            }
+        }
+        throw new \Exception("no round2 package for $id");
+    };
+    $a1 = Core::callOp(['op' => 'dkg_part1', 'id' => 1, 'max' => 2, 'min' => 2]);
+    $b1 = Core::callOp(['op' => 'dkg_part1', 'id' => 2, 'max' => 2, 'min' => 2]);
+    $a2 = Core::callOp(['op' => 'dkg_part2', 'secret' => $a1['secret'], 'round1_packages' => [[2, $b1['package']]]]);
+    $b2 = Core::callOp(['op' => 'dkg_part2', 'secret' => $b1['secret'], 'round1_packages' => [[1, $a1['package']]]]);
+    $a3 = Core::callOp(['op' => 'dkg_part3', 'secret' => $a2['secret'], 'round1_packages' => [[2, $b1['package']]],
+        'round2_packages' => [[2, $pick($b2['packages'], 1)]]]);
+    $b3 = Core::callOp(['op' => 'dkg_part3', 'secret' => $b2['secret'], 'round1_packages' => [[1, $a1['package']]],
+        'round2_packages' => [[1, $pick($a2['packages'], 2)]]]);
+    return $keys = ['client' => $a3['key_package'], 'server' => $b3['key_package'],
+        'public' => $a3['public_key_package'], 'group' => $a3['group_pubkey_hex']];
+}
+
+/** A full-scope vault secret's share: the client key package, as the wallet's settings export it. */
+function contractShare(): string
+{
+    return json_encode(contractDkg()['client'], JSON_THROW_ON_ERROR);
+}

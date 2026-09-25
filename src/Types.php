@@ -8,20 +8,37 @@ namespace Paymos\Wallet;
  * The read model, ported field-for-field from the Python SDK. Plain readonly DTOs; every amount
  * is a STRING of raw integer units, never a number — a token with 18 decimals runs past what an
  * int64 or a float holds exactly.
+ *
+ * The server OMITS a null field rather than sending null, so every optional field here tolerates
+ * absence. A REQUIRED field that is missing is a different thing — contract drift or something
+ * that is not the vault API answering — and it throws PaymosError naming the field, the way the
+ * Python SDK refuses with a KeyError. It never becomes an empty string a caller then compares.
+ * Unknown fields are ignored, so a newer server never breaks an older SDK.
  */
 final class Asset
 {
+    /**
+     * @param ?string $fingerprint lowercase hex sha256 of the asset's raw id — what the co-sign
+     *   guard matches each disclosed transfer's token against, unless the label is pinned (see
+     *   Wallet's $pinnedFingerprints). It comes from the same server that builds the messages, so
+     *   on its own it catches a server bug, not a server that lies here too. Null from an older
+     *   server that does not publish it: reads keep working, signing refuses.
+     */
     public function __construct(
         public readonly string $asset,
         public readonly string $symbol,
         public readonly string $chain,
         public readonly int $decimals,
+        public readonly ?string $fingerprint = null,
     ) {}
 
-    public static function fromWire(array $o): self
+    public static function fromWire(mixed $o): self
     {
-        return new self((string)($o['asset'] ?? ''), (string)($o['symbol'] ?? ''),
-            (string)($o['chain'] ?? ''), (int)($o['decimals'] ?? 0));
+        $o = Wire::object($o, 'asset');
+        $fingerprint = Wire::optStr($o, 'fingerprint', 'asset');
+        return new self(Wire::str($o, 'asset', 'asset'), Wire::str($o, 'symbol', 'asset'),
+            Wire::str($o, 'chain', 'asset'), Wire::int($o, 'decimals', 'asset'),
+            $fingerprint === null ? null : strtolower($fingerprint));
     }
 }
 
@@ -37,11 +54,12 @@ final class Balance
         public readonly ?string $usd,
     ) {}
 
-    public static function fromWire(array $o): self
+    public static function fromWire(mixed $o): self
     {
-        return new self((string)($o['asset'] ?? ''), (string)($o['symbol'] ?? ''),
-            (string)($o['chain'] ?? ''), (int)($o['decimals'] ?? 0),
-            (string)($o['amount_raw'] ?? ''), isset($o['usd']) ? (string)$o['usd'] : null);
+        $o = Wire::object($o, 'balance');
+        return new self(Wire::str($o, 'asset', 'balance'), Wire::str($o, 'symbol', 'balance'),
+            Wire::str($o, 'chain', 'balance'), Wire::int($o, 'decimals', 'balance'),
+            Wire::str($o, 'amount_raw', 'balance'), Wire::optStr($o, 'usd', 'balance'));
     }
 }
 
@@ -52,11 +70,23 @@ final class RouteFee
         public readonly string $amount,
         public readonly bool $estimate,
     ) {}
+
+    public static function fromWire(mixed $o): self
+    {
+        $o = Wire::object($o, 'fees.route');
+        return new self(Wire::str($o, 'amount', 'fees.route'), Wire::bool($o, 'estimate', 'fees.route'));
+    }
 }
 
 /** Every charge on an operation, split so none of them can hide inside another. */
 final class Fees
 {
+    /**
+     * @param ?RouteFee $route null when no route leg applies (an unpriced cross-asset pair).
+     * @param ?array{platform: ?string, network: ?string, route: ?string, total: ?string} $usd a
+     *   display view, null when the source asset is unpriced; every key is always present, and a
+     *   leg the server left out is null.
+     */
     public function __construct(
         public readonly string $asset,
         public readonly string $platform,
@@ -66,17 +96,20 @@ final class Fees
         public readonly ?array $usd,
     ) {}
 
-    public static function fromWire(?array $o): ?self
+    public static function fromWire(mixed $o): self
     {
-        if ($o === null) {
-            return null;
+        $o = Wire::object($o, 'fees');
+        $route = isset($o['route']) ? RouteFee::fromWire($o['route']) : null;
+        $usd = null;
+        if (isset($o['usd'])) {
+            $u = Wire::object($o['usd'], 'fees.usd');
+            $usd = [];
+            foreach (['platform', 'network', 'route', 'total'] as $k) {
+                $usd[$k] = Wire::optStr($u, $k, 'fees.usd');
+            }
         }
-        $route = isset($o['route']) && is_array($o['route'])
-            ? new RouteFee((string)($o['route']['amount'] ?? ''), (bool)($o['route']['estimate'] ?? false))
-            : null;
-        return new self((string)($o['asset'] ?? ''), (string)($o['platform'] ?? ''),
-            (string)($o['network'] ?? ''), $route, (string)($o['total'] ?? ''),
-            isset($o['usd']) && is_array($o['usd']) ? $o['usd'] : null);
+        return new self(Wire::str($o, 'asset', 'fees'), Wire::str($o, 'platform', 'fees'),
+            Wire::str($o, 'network', 'fees'), $route, Wire::str($o, 'total', 'fees'), $usd);
     }
 }
 
@@ -87,14 +120,14 @@ final class Amount
         public readonly string $asset,
     ) {}
 
-    public static function fromWire(?array $o): self
+    public static function fromWire(mixed $o, string $what = 'amount'): self
     {
-        $o ??= [];
-        return new self((string)($o['amount'] ?? ''), (string)($o['asset'] ?? ''));
+        $o = Wire::object($o, $what);
+        return new self(Wire::str($o, 'amount', $what), Wire::str($o, 'asset', $what));
     }
 }
 
-/** What arrives. $min is the floor the operation is allowed to deliver, and it is guaranteed. */
+/** What arrives. $min is the floor the route's quote commits to delivering. */
 final class Receive
 {
     public function __construct(
@@ -103,20 +136,24 @@ final class Receive
         public readonly string $asset,
     ) {}
 
-    public static function fromWire(?array $o): self
+    public static function fromWire(mixed $o): self
     {
-        $o ??= [];
-        return new self((string)($o['amount'] ?? ''), (string)($o['min'] ?? ''), (string)($o['asset'] ?? ''));
+        $o = Wire::object($o, 'receive');
+        return new self(Wire::str($o, 'amount', 'receive'), Wire::str($o, 'min', 'receive'),
+            Wire::str($o, 'asset', 'receive'));
     }
 }
 
 final class Quote
 {
     /**
+     * @param ?string $movementId null on a dry preview: nothing was persisted.
      * @param Amount $debit The MAXIMUM this quote may take from the vault, reserve against
-     *   slippage included — a ceiling, not a prediction. Approve against this and nothing can
-     *   debit more than you agreed to; an exact-output route routinely spends less and returns
-     *   the difference. Compare the finished movement's $send to see what it actually cost.
+     *   slippage included — a ceiling, not a prediction. The co-sign guard refuses sources that
+     *   move more than it; for exact_out the server computes it, so cap it with $maxDebit. An
+     *   exact-output route routinely spends less and returns the difference. Compare the finished movement's $send to see what it actually cost.
+     * @param ?int $sources how many co-sign sessions a real quote needs (one FROST commitment
+     *   each at sign/begin). The server omits it on a dry preview.
      */
     public function __construct(
         public readonly ?string $movementId,
@@ -124,22 +161,23 @@ final class Quote
         public readonly Amount $send,
         public readonly Amount $debit,
         public readonly Receive $receive,
-        public readonly ?Fees $fees,
+        public readonly Fees $fees,
         public readonly string $expiresAt,
         public readonly ?int $sources,
     ) {}
 
-    public static function fromWire(array $o): self
+    public static function fromWire(mixed $o): self
     {
+        $o = Wire::object($o, 'quote');
         return new self(
-            isset($o['movement_id']) ? (string)$o['movement_id'] : null,
-            (string)($o['mode'] ?? ''),
-            Amount::fromWire($o['send'] ?? null),
-            Amount::fromWire($o['debit'] ?? null),
-            Receive::fromWire($o['receive'] ?? null),
-            Fees::fromWire(isset($o['fees']) && is_array($o['fees']) ? $o['fees'] : null),
-            (string)($o['expires_at'] ?? ''),
-            isset($o['sources']) ? (int)$o['sources'] : null,
+            Wire::optStr($o, 'movement_id', 'quote'),
+            Wire::str($o, 'mode', 'quote'),
+            Amount::fromWire(Wire::req($o, 'send', 'quote'), 'quote.send'),
+            Amount::fromWire(Wire::req($o, 'debit', 'quote'), 'quote.debit'),
+            Receive::fromWire(Wire::req($o, 'receive', 'quote')),
+            Fees::fromWire(Wire::req($o, 'fees', 'quote')),
+            Wire::str($o, 'expires_at', 'quote'),
+            isset($o['sources']) ? Wire::int($o, 'sources', 'quote') : null,
         );
     }
 }
@@ -147,10 +185,13 @@ final class Quote
 final class Movement
 {
     /**
+     * @param string $status one of pending | processing | completed | failed | refunded | expired
+     *   | cancelled — the public vocabulary; the server never sends its internal states.
      * @param Amount $send What the movement actually cost the vault: the approved maximum minus
      *   anything the route handed back. This is the figure that matches the on-chain balance —
      *   reconcile on it. It is NOT the quote's $debit, which is the ceiling that was approved
      *   before the route ran.
+     * @param ?Fees $fees the full breakdown on a single movement; null on a history-page row.
      */
     public function __construct(
         public readonly string $id,
@@ -165,19 +206,89 @@ final class Movement
         public readonly ?string $completedAt,
     ) {}
 
-    public static function fromWire(array $o): self
+    public static function fromWire(mixed $o): self
     {
+        $o = Wire::object($o, 'movement');
         return new self(
-            (string)($o['id'] ?? ''),
-            (string)($o['type'] ?? ''),
-            (string)($o['status'] ?? ''),
-            Amount::fromWire($o['send'] ?? null),
-            Receive::fromWire($o['receive'] ?? null),
-            Fees::fromWire(isset($o['fees']) && is_array($o['fees']) ? $o['fees'] : null),
-            isset($o['dest_chain_tx_hash']) ? (string)$o['dest_chain_tx_hash'] : null,
-            isset($o['dest_chain_explorer_url']) ? (string)$o['dest_chain_explorer_url'] : null,
-            (string)($o['created_at'] ?? ''),
-            isset($o['completed_at']) ? (string)$o['completed_at'] : null,
+            Wire::str($o, 'id', 'movement'),
+            Wire::str($o, 'type', 'movement'),
+            Wire::str($o, 'status', 'movement'),
+            Amount::fromWire(Wire::req($o, 'send', 'movement'), 'movement.send'),
+            Receive::fromWire(Wire::req($o, 'receive', 'movement')),
+            isset($o['fees']) ? Fees::fromWire($o['fees']) : null,
+            Wire::optStr($o, 'dest_chain_tx_hash', 'movement'),
+            Wire::optStr($o, 'dest_chain_explorer_url', 'movement'),
+            Wire::str($o, 'created_at', 'movement'),
+            Wire::optStr($o, 'completed_at', 'movement'),
         );
+    }
+}
+
+/**
+ * @internal Field readers for the models above. Each one throws PaymosError naming the field
+ * when the wire does not carry what the contract says it does.
+ */
+final class Wire
+{
+    /** A JSON object. `{}` decodes to [] in PHP, so an empty array passes; a non-empty list does not. */
+    public static function object(mixed $v, string $what): array
+    {
+        if (!is_array($v) || ($v !== [] && array_is_list($v))) {
+            throw new PaymosError("malformed response: $what is not a JSON object");
+        }
+        return $v;
+    }
+
+    /** A JSON array, as the /assets and /balances endpoints answer — bare, not wrapped. */
+    public static function list(mixed $v, string $what): array
+    {
+        if (!is_array($v) || !array_is_list($v)) {
+            throw new PaymosError("malformed response: $what is not a JSON array");
+        }
+        return $v;
+    }
+
+    public static function req(array $o, string $key, string $what): mixed
+    {
+        if (!isset($o[$key])) {
+            throw new PaymosError("malformed response: $what.$key is missing");
+        }
+        return $o[$key];
+    }
+
+    public static function str(array $o, string $key, string $what): string
+    {
+        $v = self::req($o, $key, $what);
+        if (!is_string($v) && !is_int($v)) {
+            throw new PaymosError("malformed response: $what.$key is not a string");
+        }
+        return (string)$v;
+    }
+
+    /** Absent and null are the same thing on this wire: the server omits what is null. */
+    public static function optStr(array $o, string $key, string $what): ?string
+    {
+        return isset($o[$key]) ? self::str($o, $key, $what) : null;
+    }
+
+    public static function int(array $o, string $key, string $what): int
+    {
+        $v = self::req($o, $key, $what);
+        if (is_string($v) && preg_match('/^-?[0-9]{1,18}$/D', $v)) {
+            return (int)$v;
+        }
+        if (!is_int($v)) {
+            throw new PaymosError("malformed response: $what.$key is not an integer");
+        }
+        return $v;
+    }
+
+    public static function bool(array $o, string $key, string $what): bool
+    {
+        $v = self::req($o, $key, $what);
+        if (!is_bool($v)) {
+            throw new PaymosError("malformed response: $what.$key is not a boolean");
+        }
+        return $v;
     }
 }

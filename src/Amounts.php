@@ -21,7 +21,7 @@ final class Amounts
             throw new PaymosError('decimals must be >= 0');
         }
         $s = trim($human);
-        if (!preg_match('/^\d+(\.\d+)?$/', $s)) {
+        if (!preg_match('/^[0-9]+(\.[0-9]+)?$/D', $s)) {
             throw new PaymosError("not a non-negative decimal: " . var_export($human, true));
         }
         [$whole, $frac] = array_pad(explode('.', $s, 2), 2, '');
@@ -41,7 +41,7 @@ final class Amounts
             $sign = '-';
             $digits = substr($digits, 1);
         }
-        if (!preg_match('/^\d+$/', $digits)) {
+        if (!preg_match('/^[0-9]+$/D', $digits)) {
             throw new PaymosError("not a raw integer amount: " . var_export($raw, true));
         }
         $digits = self::stripLeadingZeros($digits);
@@ -91,7 +91,8 @@ final class Amounts
 
     private static function checked(string $raw): string
     {
-        if (!preg_match('/^\d+$/', $raw)) {
+        // ASCII digits and nothing after them: without /D, "$" also matches before a final "\n".
+        if (!preg_match('/^[0-9]+$/D', $raw)) {
             throw new PaymosError("bad raw amount: " . var_export($raw, true));
         }
         return $raw;

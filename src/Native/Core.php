@@ -213,7 +213,7 @@ final class Core
         $body = curl_exec($ch);
         $status = (int)curl_getinfo($ch, CURLINFO_RESPONSE_CODE);
         $err = curl_error($ch);
-        curl_close($ch);
+        // No curl_close(): a no-op since PHP 8.0, deprecated in 8.5.
         if ($body === false || $status !== 200) {
             throw new PaymosError(
                 "failed to download the co-signing core: $url answered $status $err. "
