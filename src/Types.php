@@ -6,8 +6,13 @@ namespace Paymos\Wallet;
 
 /**
  * The read model, ported field-for-field from the Python SDK. Plain readonly DTOs; every amount
- * is a STRING of raw integer units, never a number — a token with 18 decimals runs past what an
- * int64 or a float holds exactly.
+ * IN THESE RESPONSE TYPES is a STRING of raw integer units, never a number — a token with 18
+ * decimals runs past what an int64 or a float holds exactly. Amounts::formatUnits shows one as a
+ * human decimal; Amounts::parseUnits turns a human figure into raw units to COMPARE with one.
+ *
+ * The amounts you PASS to Wallet are the other way round: human decimal strings ('100', '0.5'),
+ * which the server scales. Never pass the output of parseUnits there — '10000' meant as 0.01 USDC
+ * is read as 10 000 USDC.
  *
  * The server OMITS a null field rather than sending null, so every optional field here tolerates
  * absence. A REQUIRED field that is missing is a different thing — contract drift or something

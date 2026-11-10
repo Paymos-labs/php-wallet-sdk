@@ -69,14 +69,30 @@ final class Wallet
      *
      * @param null|array<string, string|list<string>> $pinnedFingerprints
      */
-    public function __construct(string $secret, ?string $baseUrl = null, ?int $timeoutSeconds = null,
-                                ?callable $transport = null, ?array $pinnedFingerprints = null)
+    public function __construct(#[\SensitiveParameter] string $secret, ?string $baseUrl = null,
+                                ?int $timeoutSeconds = null, ?callable $transport = null,
+                                ?array $pinnedFingerprints = null)
     {
         $this->secret = VaultSecret::parse($secret);
         $this->pinned = self::normalizePins($pinnedFingerprints ?? []);
         $baseUrl ??= self::env('PAYMOS_BASE_URL') ?? self::DEFAULT_BASE_URL;
         $this->http = new Http(rtrim($baseUrl, '/'), $this->secret->apiKey,
             $timeoutSeconds ?? 60, $transport);
+    }
+
+    /**
+     * What var_dump, print_r and Symfony's VarDumper show of a wallet: which vault, whether it can
+     * sign, the key's vk_live_ prefix — never the key or the share. (var_export, an (array) cast and
+     * serialize() have no such hook in PHP; do not hand them a wallet.)
+     */
+    public function __debugInfo(): array
+    {
+        return [
+            'vaultId' => $this->secret->vaultId,
+            'hasShare' => $this->secret->hasShare(),
+            'apiKey' => VaultSecret::mask($this->secret->apiKey),
+            'pinnedFingerprints' => $this->pinned,
+        ];
     }
 
     /** Reads PAYMOS_VAULT_SECRET (and PAYMOS_BASE_URL unless $baseUrl is given), the way a deployed process is configured. */
@@ -211,7 +227,13 @@ final class Wallet
 
     // ── quotes ───────────────────────────────────────────────────────────────
 
-    /** A dry preview. Nothing is created and nothing is signed. */
+    /**
+     * A dry preview. Nothing is created and nothing is signed.
+     *
+     * $amount is a HUMAN decimal string in the send asset ('100', '0.5'); the server scales it by
+     * the asset's decimals. The quote comes back in raw integer strings. Never pass
+     * Amounts::parseUnits output here: '10000' is ten thousand of the asset, not 0.01.
+     */
     public function quoteSwap(string $send, string $receive, string $amount, int $slippageBps = 50): Quote
     {
         $this->validateAmount($amount, $send);
@@ -222,7 +244,12 @@ final class Wallet
         ], true);
     }
 
-    /** A dry preview. Nothing is created and nothing is signed. */
+    /**
+     * A dry preview. Nothing is created and nothing is signed.
+     *
+     * $amount is a HUMAN decimal string in $asset ('25', '0.01'); the server scales it. The quote
+     * comes back in raw integer strings. Never pass Amounts::parseUnits output here.
+     */
     public function quoteWithdraw(string $asset, string $amount, string $to, string $mode = 'exact_out'): Quote
     {
         $this->validateAmount($amount, $asset);
@@ -233,18 +260,27 @@ final class Wallet
 
     // ── money ────────────────────────────────────────────────────────────────
 
+    /**
+     * Swaps $amount of $send for $receive, delivered back to this vault: a real movement,
+     * co-signed. Full-key secrets only.
+     *
+     * $amount, $minReceive and $maxDebit are HUMAN decimal strings ('100', '99.5') that the server
+     * scales by each asset's decimals — never Amounts::parseUnits output, which would be read as
+     * that many whole units: swap('USDC@base', 'USDT@base', '10000') swaps ten thousand USDC.
+     */
     public function swap(string $send, string $receive, string $amount, int $slippageBps = 50,
                          ?string $minReceive = null, ?string $maxDebit = null,
                          ?string $idempotencyKey = null): Movement
     {
         $this->requireShare('swap');
+        $key = self::idempotencyKeyOf($idempotencyKey);
         $sendDec = $this->validateAmount($amount, $send);
         $recvDec = $this->decimalsOf($receive);
 
         $q = $this->quote('/vault/v1/quote/swap', [
             'send' => $send, 'receive' => $receive, 'amount' => $amount, 'mode' => 'exact_in',
             'slippage_bps' => $slippageBps,
-        ], false, $idempotencyKey ?? self::freshIdempotencyKey());
+        ], false, $key);
 
         if ($minReceive !== null) {
             $floor = Amounts::parseUnits($minReceive, $recvDec);
@@ -260,15 +296,24 @@ final class Wallet
         return $this->movement(self::requireMovementId($q));
     }
 
+    /**
+     * Pays $amount of $asset out to $to: a real movement, co-signed. Full-key secrets only.
+     *
+     * $amount and $maxDebit are HUMAN decimal strings ('25', '0.01') that the server scales by the
+     * asset's decimals — never Amounts::parseUnits output. withdraw('USDC@base', '10000', $to),
+     * which is what parseUnits('0.01', 6) returns, pays out ten thousand USDC; the SDK and the server
+     * agree on that number, so no check can tell it from an intended one.
+     */
     public function withdraw(string $asset, string $amount, string $to, string $mode = 'exact_out',
                              ?string $maxDebit = null, ?string $idempotencyKey = null): Movement
     {
         $this->requireShare('withdraw');
+        $key = self::idempotencyKeyOf($idempotencyKey);
         $dec = $this->validateAmount($amount, $asset);
 
         $q = $this->quote('/vault/v1/quote/withdraw', [
             'asset' => $asset, 'amount' => $amount, 'to' => $to, 'mode' => $mode,
-        ], false, $idempotencyKey ?? self::freshIdempotencyKey());
+        ], false, $key);
 
         // A withdraw is same-asset. For exact_out the approved amount is the guaranteed OUT; for
         // total_in it is the total DEBIT — and the send leg is total minus fees, so pinning send
@@ -500,23 +545,21 @@ final class Wallet
                 throw new PaymosError("co-sign refused: signing package $i does not bind to the disclosed message");
             }
 
-            // (2) structure and own-vault: one transfer, signed from this vault and no other.
-            $parsed = json_decode($message, true, 512, JSON_BIGINT_AS_STRING);
-            if (!is_array($parsed)) {
-                throw new PaymosError("co-sign refused: unreadable message for source $i");
-            }
-            $list = $parsed['intents'] ?? null;
-            if (!is_array($list) || !array_is_list($list) || count($list) !== 1
-                || !is_array($list[0]) || ($list[0]['intent'] ?? null) !== 'transfer') {
+            // (2) structure and own-vault: one transfer, signed from this vault and no other. Read
+            // the way the verifier on chain reads it — see parseStrictMessage.
+            $parsed = self::parseStrictMessage($message, $i);
+            $list = $parsed->intents ?? null;
+            if (!is_array($list) || count($list) !== 1
+                || !($list[0] instanceof \stdClass) || ($list[0]->intent ?? null) !== 'transfer') {
                 throw new PaymosError("co-sign refused: source $i is not a single transfer intent");
             }
             $one = $list[0];
-            $signerId = $parsed['signer_id'] ?? null;
+            $signerId = $parsed->signer_id ?? null;
             if (!is_string($signerId) || strtolower($signerId) !== $expectedSigner) {
                 throw new PaymosError("co-sign refused: source $i signs from a different vault");
             }
-            $tokens = $one['tokens'] ?? null;
-            if (!is_array($tokens) || count($tokens) !== 1) {
+            $tokens = ($one->tokens ?? null) instanceof \stdClass ? get_object_vars($one->tokens) : null;
+            if ($tokens === null || count($tokens) !== 1) {
                 throw new PaymosError("co-sign refused: source $i does not transfer exactly one token");
             }
             // (2b) the token: the one it moves must be the asset the debit was approved in.
@@ -544,6 +587,82 @@ final class Wallet
         }
     }
 
+    /**
+     * A disclosed message, decoded the way the on-chain verifier reads it — the verifier re-parses
+     * these exact bytes, so the guard must not read them another way. Three things json_decode
+     * would otherwise do differently:
+     *   - it keeps the LAST of a repeated object key, where the verifier rejects the message — a
+     *     repeated key (at any depth, escaped spellings included) is refused here;
+     *   - as associative arrays, {"0": …} and [ … ] decode alike and array_is_list cannot tell
+     *     them apart — objects stay stdClass, so only a JSON array reads as a list;
+     *   - JSON_BIGINT_AS_STRING turns a JSON number too big for an int into a string that passes
+     *     a digits check — it is not used, so a number stays a number and is refused as an amount.
+     * Nesting is capped at 64 levels; a transfer message has four.
+     */
+    private static function parseStrictMessage(string $message, int $i): \stdClass
+    {
+        try {
+            $parsed = json_decode($message, false, 64, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            throw new PaymosError("co-sign refused: unreadable message for source $i: {$e->getMessage()}");
+        }
+        $repeated = self::repeatedKey($message);
+        if ($repeated !== null) {
+            throw new PaymosError("co-sign refused: unreadable message for source $i: duplicate key \"$repeated\"");
+        }
+        if (!$parsed instanceof \stdClass) {
+            throw new PaymosError("co-sign refused: unreadable message for source $i");
+        }
+        return $parsed;
+    }
+
+    /**
+     * The first key that some object in $json repeats, or null. Runs only on text json_decode has
+     * already accepted, so it need only find keys: a string followed by ':' is one — no value string
+     * ever is — compared after json_decode resolves its escapes. Iterative: the nesting is the
+     * server's to choose, and a recursion depth is not.
+     */
+    private static function repeatedKey(string $json): ?string
+    {
+        $open = []; // one entry per open container: an object's seen keys, or null for an array
+        $len = strlen($json);
+        for ($i = 0; $i < $len;) {
+            $c = $json[$i];
+            if ($c === '"') {
+                $end = $i + 1;
+                while ($json[$end] !== '"') {
+                    $end += $json[$end] === '\\' ? 2 : 1;
+                }
+                $literal = substr($json, $i, $end - $i + 1);
+                $i = $end + 1;
+                $next = $i;
+                while ($next < $len && ($json[$next] === ' ' || $json[$next] === "\t"
+                        || $json[$next] === "\n" || $json[$next] === "\r")) {
+                    $next++;
+                }
+                if ($next < $len && $json[$next] === ':') {
+                    $key = (string)json_decode($literal);
+                    $top = array_key_last($open);
+                    // 'k' . $key: a PHP array would turn a key like "12" into the integer 12.
+                    if ($top === null || $open[$top] === null || isset($open[$top]['k' . $key])) {
+                        return $key;
+                    }
+                    $open[$top]['k' . $key] = true;
+                }
+                continue;
+            }
+            if ($c === '{') {
+                $open[] = [];
+            } elseif ($c === '[') {
+                $open[] = null;
+            } elseif ($c === '}' || $c === ']') {
+                array_pop($open);
+            }
+            $i++;
+        }
+        return null;
+    }
+
     /** @return list<string> the fingerprints the guard accepts for $label, lowercase */
     private function acceptedFingerprints(string $label): array
     {
@@ -564,6 +683,23 @@ final class Wallet
             }
         }
         return $accepted;
+    }
+
+    /**
+     * The key a money call is sent under: the caller's, or a fresh one when they passed null. An
+     * empty or blank key is refused. It used to go out as an empty header, which the server reads
+     * as no key at all: a retry paid again while the caller believed it was deduplicated.
+     */
+    private static function idempotencyKeyOf(?string $key): string
+    {
+        if ($key === null) {
+            return self::freshIdempotencyKey();
+        }
+        if (trim($key) === '') {
+            throw new PaymosError('idempotencyKey is empty — pass a durable key (a payout or job id) so a retry '
+                . 'replays the same movement, or leave it null for a fresh one per call');
+        }
+        return $key;
     }
 
     /** uuid-v4-shaped hex without the dashes — the same shape the other SDKs generate. */

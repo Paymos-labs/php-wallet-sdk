@@ -187,6 +187,57 @@ test('cosign: a lying server is refused before a single share exists', function 
     }
 });
 
+test('cosign: a message the verifier would read another way is refused before a share exists', function () {
+    // Each rewrite is re-disclosed and re-bound by a server that controls both. Read the way
+    // json_decode(assoc) reads — last key wins, {"0":…} indistinguishable from […] — each would
+    // pass as one transfer inside the debit; the verifier on chain reads none of them that way.
+    $decoy = '{"intent":"transfer","tokens":{"usdc-base":"1"}}';
+    $rewrites = [
+        'intents repeated' => fn ($msg) => str_replace(',"signer_id"', ',"intents":[' . $decoy . '],"signer_id"', $msg),
+        'intents repeated, escaped' => fn ($msg) => str_replace(',"signer_id"', ',"intents":[' . $decoy . '],"signer_id"', $msg),
+        'a token repeated' => fn ($msg) => preg_replace('/"tokens":\{("usdc-base":"\d+")\}/', '"tokens":{$1,"usdc-base":"1"}', $msg),
+        'signer_id repeated' => fn ($msg) => str_replace('{"deadline"', '{"signer_id":"someone.else","deadline"', $msg),
+        'intents as an object' => fn ($msg) => preg_replace('/"intents":\[(\{.*?\})\]/', '"intents":{"0":$1}', $msg),
+        'nested past 64 levels' => fn ($msg) => str_replace(',"signer_id"',
+            ',"memo":' . str_repeat('[', 100) . str_repeat(']', 100) . ',"signer_id"', $msg),
+    ];
+    foreach ($rewrites as $what => $rewrite) {
+        $srv = new CosignServer();
+        $srv->tamper = function ($m, $p) use ($rewrite) {
+            foreach ($m as $i => $d) {
+                $m[$i]['message'] = $rewrite($d['message']);
+                $p[$i]['message'] = Digest::payloadDigestHex($m[$i]['message'], hex2bin($d['nonce']), $d['recipient']);
+            }
+            return [$m, $p];
+        };
+        $e = throws(fn () => $srv->wallet()->withdraw('USDC@base', '10', CONTRACT_TO));
+        ok(str_starts_with($e->getMessage(), 'co-sign refused:'), "$what: " . $e->getMessage());
+        eq(0, $srv->aggregated(), "$what: nothing aggregated");
+    }
+});
+
+test('guard: the message parse keeps objects, numbers and keys as the verifier reads them', function () {
+    $parse = new \ReflectionMethod(\Paymos\Wallet\Wallet::class, 'parseStrictMessage');
+    // A JSON number past PHP_INT_MAX stays a number: JSON_BIGINT_AS_STRING would have made it a
+    // string that passes the amount's digits check, where the verifier wants a JSON string.
+    $m = $parse->invoke(null, '{"intents":[{"intent":"transfer","tokens":{"t":10000000000000000000}}]}', 0);
+    ok(!is_string($m->intents[0]->tokens->t), 'a number stays a number');
+    // "Intents" next to "intents" is two keys, as it is to the verifier.
+    $m = $parse->invoke(null, '{"intents":[],"Intents":[1]}', 0);
+    eq([], $m->intents);
+    // Every recorded fixture parses, and so does the message sign_begin discloses.
+    foreach (glob(contractFixturesDir() . '/*.json') as $file) {
+        $raw = (string)file_get_contents($file);
+        if (str_starts_with(trim($raw), '{')) {
+            $parse->invoke(null, $raw, 0);
+        }
+    }
+    $parse->invoke(null, fixture('sign_begin')['response']['body']['messages'][0]['message'], 0);
+    foreach (['{"a":1,"a":2}', '{"a":{"b":[{"c":1,"c":1}]}}', '[1]', '{"a":1} {"b":2}'] as $bad) {
+        throws(fn () => $parse->invoke(null, $bad, 0));
+    }
+});
+
 test('cosign: sign_aggregate_error is raised with the server\'s message, never swallowed', function () {
     $srv = new CosignServer();
     $srv->aggregateResponse = 'sign_aggregate_error';

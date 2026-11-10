@@ -31,11 +31,17 @@ final class Http
 
     public function __construct(
         private readonly string $baseUrl,
-        private readonly string $apiKey,
+        #[\SensitiveParameter] private readonly string $apiKey,
         private readonly int $timeout = self::DEFAULT_TIMEOUT,
         ?callable $transport = null,
     ) {
         $this->transport = $transport;
+    }
+
+    /** var_dump and print_r show where the transport points, and the key's prefix only. */
+    public function __debugInfo(): array
+    {
+        return ['baseUrl' => $this->baseUrl, 'apiKey' => VaultSecret::mask($this->apiKey)];
     }
 
     /** @return mixed parsed JSON body */
